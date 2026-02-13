@@ -14,6 +14,7 @@ PING_INTERVAL = 20
 USERS = {
     "Jonathan Guerrero": "JonathanPass",
     "bob": "bobpass",
+    "alice": "alicepass",
 }
 
 CONNECTED = {}  # ws -> username
