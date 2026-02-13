@@ -19,6 +19,38 @@ USERS = {
 
 CONNECTED = {}  # ws -> username
 
+LOGIN_LIMITERS = {}
+WS_LIMITERS = {}
+
+LOGIN_CAPACITY = 5
+LOGIN_REFILL_PER_SEC = 5/60
+
+CHAT_CAPACITY = 3
+CHAT_REFILL_PER_SEC = 1
+
+TYPING_CAPACITY = 3
+TYPING_REFILL_PER_SEC = 1
+
+class TokenBucket:
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = float(capacity)
+        self.refill_rate = float(refill_rate)
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
+
+    def allow(self, cost: float = 1.0) -> bool:
+        now = time.monotonic()
+        elapsed = now - self.last
+        self.last = now
+
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+
+        if self.tokens >= cost:
+            self.tokens -= cost
+            return True
+        return False
+
+
 def make_jwt(username):
     now = int(time.time())
     payload = {"sub": username, "iat": now, "exp": now + JWT_EXP_SECONDS}
@@ -31,6 +63,15 @@ def verify_jwt(token):
         return None
 
 async def login(request):
+    ip = request.headers.get("X-Forwarded-For", request.remote) or "unknown"
+
+    limiter = LOGIN_LIMITERS.get(ip)
+    if limiter is None:
+        limiter = LOGIN_LIMITERS[ip] = TokenBucket(LOGIN_CAPACITY, LOGIN_REFILL_PER_SEC)
+
+    if not limiter.allow():
+        return web.json_response({"error": "rate_limited"}, status=429)
+
     data = await request.json()
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
@@ -67,6 +108,19 @@ async def websocket_handler(request):
 
     CONNECTED[ws] = user
 
+    def ws_allow(kind: str) -> bool:
+        key = (user, kind)
+        lim = WS_LIMITERS.get(key)
+
+        if lim is None:
+            if kind == "chat":
+                lim = WS_LIMITERS[key] = TokenBucket(CHAT_CAPACITY, CHAT_REFILL_PER_SEC)
+            else:  # typing
+                lim = WS_LIMITERS[key] = TokenBucket(TYPING_CAPACITY, TYPING_REFILL_PER_SEC)
+
+        return lim.allow()
+
+
     # Send full online list to the new user
     await ws.send_str(json.dumps({
         "type": "online_list",
@@ -90,17 +144,26 @@ async def websocket_handler(request):
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                payload = json.loads(msg.data)
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+
                 mtype = payload.get("type")
 
                 if mtype == "typing":
-                    await broadcast("typing", {"user": user, "isTyping": payload["isTyping"]}, exclude=ws)
+                    if not ws_allow("typing"):
+                        await ws.send_str(json.dumps({"type": "error", "data": {"error": "rate_limited"}}))
+                        continue
+                    await broadcast("typing", {"user": user, "isTyping": payload.get("isTyping", False)}, exclude=ws)
                     continue
 
                 if mtype == "chat":
-                    await broadcast("chat", {"from": user, "text": payload["text"]}, exclude=ws)
+                    if not ws_allow("chat"):
+                        await ws.send_str(json.dumps({"type": "error", "data": {"error": "rate_limited"}}))
+                        continue
+                    await broadcast("chat", {"from": user, "text": payload.get("text", "")}, exclude=ws)
                     continue
-
 
     finally:
         old_user = CONNECTED.pop(ws, None)
